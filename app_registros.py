@@ -16,7 +16,7 @@ import re
 # INICIALIZACIÓN DE FIREBASE
 # ---------------------------
 import firebase_admin
-from firebase_admin import credentials, firestore, storage
+from firebase_admin import credentials, firestore
 
 firebase_secrets = st.secrets["firebase"]
 
@@ -33,12 +33,9 @@ if not firebase_admin._apps:
         "auth_provider_x509_cert_url": firebase_secrets["auth_provider_x509_cert_url"],
         "client_x509_cert_url": firebase_secrets["client_x509_cert_url"]
     })
-    firebase_admin.initialize_app(cred, {
-        'storageBucket': firebase_secrets["storageBucket"]
-    })
+    firebase_admin.initialize_app(cred)
 
 db = firestore.client()
-bucket = storage.bucket()
 
 # ---------------------------
 # CONFIGURACIÓN DE HORARIOS
@@ -54,6 +51,16 @@ def get_week_filename():
     now = datetime.now()
     year, week, _ = now.isocalendar()
     return f"registro_{year}_W{week}.xlsx"
+
+def get_week_id(filename=None):
+    """Obtiene el ID de semana para Firestore (ej. '2026_W11') a partir del filename o la fecha actual."""
+    if filename:
+        match = re.match(r"registro_(\d{4}_W\d+)\.xlsx", filename)
+        if match:
+            return match.group(1)
+    now = datetime.now()
+    year, week, _ = now.isocalendar()
+    return f"{year}_W{week}"
 
 def utc_to_lima(utc_dt):
     """Convierte un datetime en UTC a la hora de Lima (America/Lima)."""
@@ -85,17 +92,15 @@ def create_summary_df(df):
     summary_df = summary_df.sort_values("Nombre")
     return summary_df
 
-def save_week_data_and_upload(df, filename):
+def generate_excel_bytes(df):
     """
-    Guarda el DataFrame en un archivo Excel con dos hojas: 'Registros' y 'Resumen',
-    ajusta las columnas, añade bordes a las celdas y sube el archivo directamente a Firebase Storage.
-    Se utiliza un buffer en memoria, sin escribir en disco.
+    Genera un archivo Excel en memoria con dos hojas: 'Registros' y 'Resumen',
+    ajusta columnas y añade bordes. Retorna los bytes del archivo.
     """
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, sheet_name='Registros', index=False)
         ws = writer.sheets['Registros']
-        # Autoajuste de columnas para 'Registros'
         for col_cells in ws.columns:
             max_length = 0
             col_letter = col_cells[0].column_letter
@@ -109,7 +114,6 @@ def save_week_data_and_upload(df, filename):
         summary_df = create_summary_df(df)
         summary_df.to_excel(writer, sheet_name='Resumen', index=False)
         ws_summary = writer.sheets['Resumen']
-        # Autoajuste de columnas para 'Resumen'
         for col_cells in ws_summary.columns:
             max_length = 0
             col_letter = col_cells[0].column_letter
@@ -120,11 +124,10 @@ def save_week_data_and_upload(df, filename):
                         max_length = cell_length
             ws_summary.column_dimensions[col_letter].width = max_length + 2
 
-        # Agregar bordes a todas las celdas en ambas hojas
         thin_border = Border(
-            left=Side(style="thin"), 
-            right=Side(style="thin"), 
-            top=Side(style="thin"), 
+            left=Side(style="thin"),
+            right=Side(style="thin"),
+            top=Side(style="thin"),
             bottom=Side(style="thin")
         )
         for ws_sheet in [writer.sheets['Registros'], writer.sheets['Resumen']]:
@@ -133,25 +136,37 @@ def save_week_data_and_upload(df, filename):
                     cell.border = thin_border
 
     output.seek(0)
-    blob = bucket.blob(filename)
-    blob.upload_from_string(output.read(), content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-    st.write(f"Archivo {filename} subido a Firebase Storage.")
+    return output.read()
+
+def save_week_data_and_upload(df, filename):
+    """
+    Guarda el DataFrame en Firestore bajo la colección 'semanas/{week_id}/registros'.
+    Cada fila se guarda como un documento con ID '{Nombre}_{Fecha}'.
+    """
+    week_id = get_week_id(filename)
+    registros_ref = db.collection("semanas").document(week_id).collection("registros")
+
+    for _, row in df.iterrows():
+        doc_id = f"{row['Nombre']}_{row['Fecha']}"
+        registros_ref.document(doc_id).set(row.to_dict())
 
 def load_week_data(filename):
     """
-    Intenta cargar el DataFrame de la hoja 'Registros' desde Firebase Storage.
-    Si no existe, se crea uno nuevo y se sube.
+    Carga el DataFrame desde Firestore.
+    Si no existen registros para la semana, retorna un DataFrame vacío.
     """
-    blob = bucket.blob(filename)
-    if blob.exists():
-        data = blob.download_as_bytes()
-        df = pd.read_excel(io.BytesIO(data), sheet_name='Registros')
+    week_id = get_week_id(filename)
+    registros_ref = db.collection("semanas").document(week_id).collection("registros")
+    docs = list(registros_ref.stream())
+
+    if docs:
+        rows = [doc.to_dict() for doc in docs]
+        df = pd.DataFrame(rows)
+        cols = ["Nombre", "Fecha", "Entrada", "Salida", "Horas Trabajadas"]
+        df = df.reindex(columns=cols)
         return df
     else:
-        df = pd.DataFrame(columns=["Nombre", "Fecha", "Entrada", "Salida", "Horas Trabajadas"])
-        save_week_data_and_upload(df, filename)
-        st.write(f"Nuevo archivo para la semana creado: {filename}")
-        return df
+        return pd.DataFrame(columns=["Nombre", "Fecha", "Entrada", "Salida", "Horas Trabajadas"])
 
 def update_firestore(worker, data):
     """
@@ -174,11 +189,11 @@ def register_event(worker, event_type):
     filename = get_week_filename()
     df = load_week_data(filename)
     today_str = datetime.now().strftime("%Y-%m-%d")
-    
+
     now_utc = datetime.now(pytz.utc)
     local_now = utc_to_lima(now_utc)
     now_str = format_datetime(now_utc)
-    
+
     # Validar horario según tipo de evento
     if event_type == "entrada":
         if local_now.hour >= ENTRY_DEADLINE:
@@ -186,9 +201,9 @@ def register_event(worker, event_type):
     elif event_type == "salida":
         if local_now.hour > EXIT_START or (local_now.hour == EXIT_START and local_now.minute > 0):
             return False, "Fuera del horario permitido para marcar salida (hasta las 6:00 PM)."
-    
+
     record = df[(df["Nombre"] == worker) & (df["Fecha"] == today_str)]
-    
+
     if event_type == "entrada":
         if not record.empty and pd.notna(record.iloc[0]["Entrada"]):
             return False, "Ya se ha registrado una entrada hoy para este trabajador."
@@ -207,13 +222,13 @@ def register_event(worker, event_type):
         save_week_data_and_upload(df, filename)
         update_firestore(worker, {"Fecha": today_str, "Evento": "entrada", "Timestamp": now_str})
         return True, f"Entrada registrada para {worker} a las {now_str}"
-    
+
     elif event_type == "salida":
         if record.empty or pd.isna(record.iloc[0]["Entrada"]):
             return False, "No se ha registrado entrada hoy para este trabajador."
         if pd.notna(record.iloc[0]["Salida"]) and record.iloc[0]["Salida"] != "No marcó salida":
             return False, "Ya se ha registrado una salida hoy para este trabajador."
-        
+
         idx = record.index[0]
         df.at[idx, "Salida"] = now_str
         try:
@@ -226,7 +241,7 @@ def register_event(worker, event_type):
         save_week_data_and_upload(df, filename)
         update_firestore(worker, {"Fecha": today_str, "Evento": "salida", "Timestamp": now_str})
         return True, f"Salida registrada para {worker} a las {now_str}"
-    
+
     return False, "Evento desconocido."
 
 def get_worker_week_hours(worker):
@@ -244,33 +259,45 @@ def get_worker_week_hours(worker):
 # ---------------------------
 def generate_monthly_file(selected_year, selected_month):
     """
-    Reúne todos los registros de los archivos semanales almacenados en Firebase Storage correspondientes
-    al mes y año seleccionados. Filtra los registros en base a la columna "Fecha" (formato YYYY-MM-DD).
-    Genera un archivo Excel con dos hojas: "Registros" y "Resumen", manteniendo el estilo y formato.
+    Reúne todos los registros semanales almacenados en Firestore correspondientes
+    al mes y año seleccionados. Genera un archivo Excel con dos hojas: 'Registros' y 'Resumen'.
     Retorna el contenido binario del archivo.
     """
-    blobs = list(bucket.list_blobs(prefix="registro_"))  # lista de blobs
+    week_docs = list(db.collection("semanas").stream())
     monthly_dfs = []
-    for blob in blobs:
+
+    for week_doc in week_docs:
+        week_id = week_doc.id
+        if not re.match(r"\d{4}_W\d+", week_id):
+            continue
         try:
-            data = blob.download_as_bytes()
-            df_week = pd.read_excel(io.BytesIO(data), sheet_name='Registros')
+            registros_ref = db.collection("semanas").document(week_id).collection("registros")
+            docs = list(registros_ref.stream())
+            if not docs:
+                continue
+            rows = [doc.to_dict() for doc in docs]
+            df_week = pd.DataFrame(rows).reindex(
+                columns=["Nombre", "Fecha", "Entrada", "Salida", "Horas Trabajadas"]
+            )
             if not df_week.empty:
                 df_week["Fecha_dt"] = pd.to_datetime(df_week["Fecha"], format="%Y-%m-%d", errors="coerce")
-                mask = (df_week["Fecha_dt"].dt.year == selected_year) & (df_week["Fecha_dt"].dt.month == selected_month)
+                mask = (
+                    (df_week["Fecha_dt"].dt.year == selected_year) &
+                    (df_week["Fecha_dt"].dt.month == selected_month)
+                )
                 df_filtered = df_week.loc[mask].drop(columns=["Fecha_dt"])
                 if not df_filtered.empty:
                     monthly_dfs.append(df_filtered)
         except Exception as e:
-            st.error(f"Error procesando el archivo {blob.name}: {e}")
-    
+            st.error(f"Error procesando la semana {week_id}: {e}")
+
     if not monthly_dfs:
         st.error("No se encontraron registros para el mes y año seleccionados.")
         return None
 
     df_month = pd.concat(monthly_dfs, ignore_index=True)
     resumen_month = create_summary_df(df_month)
-    
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df_month.to_excel(writer, sheet_name='Registros', index=False)
@@ -316,10 +343,10 @@ def generate_monthly_file(selected_year, selected_month):
 _pattern_week = re.compile(r"registro_(\d{4})_W(\d{1,2})\.xlsx")
 
 def list_week_files() -> list[str]:
-    """Devuelve los blobs con patrón registro_YYYY_Www.xlsx (solo semanas)."""
-    return sorted(
-        [b.name for b in bucket.list_blobs(prefix="registro_") if _pattern_week.match(b.name)]
-    )
+    """Devuelve los nombres de archivo semanales disponibles en Firestore."""
+    week_docs = list(db.collection("semanas").stream())
+    week_ids = [doc.id for doc in week_docs if re.match(r"\d{4}_W\d+", doc.id)]
+    return sorted([f"registro_{wid}.xlsx" for wid in week_ids])
 
 def week_files_for_month(year: int, month: int, all_files: list[str]) -> list[str]:
     """Filtra las semanas cuyo primer día ISO-week cae en el mes/año dados."""
@@ -332,12 +359,13 @@ def week_files_for_month(year: int, month: int, all_files: list[str]) -> list[st
     return target
 
 def zip_blobs(blob_names: list[str]) -> io.BytesIO:
-    """Crea un ZIP en memoria con los blobs dados y lo devuelve."""
+    """Crea un ZIP en memoria con archivos Excel generados desde Firestore."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name in blob_names:
-            data = bucket.blob(name).download_as_bytes()
-            zf.writestr(name, data)
+            df = load_week_data(name)
+            excel_data = generate_excel_bytes(df)
+            zf.writestr(name, excel_data)
     buf.seek(0)
     return buf
 
@@ -348,23 +376,23 @@ def zip_blobs(blob_names: list[str]) -> io.BytesIO:
 user_list = ["Nelida Ruiz", "Ricardo Adrian Ruiz", "Paula Lecaros"]
 user_passwords = st.secrets["user_passwords"]
 
-st.title("Registro de Entradas y Salidas (CLOUD: Firestore + Firebase Storage)")
+st.title("Registro de Entradas y Salidas (CLOUD: Firestore)")
 
 with st.expander("Selecciona al Trabajador"):
     worker = st.selectbox("Elige tu nombre:", [""] + user_list)
 
 if worker:
     password_input = st.text_input("Ingrese su contraseña:", type="password")
-    
+
     if password_input:
         if password_input == user_passwords.get(worker, ""):
             if worker == "Ricardo Adrian Ruiz":
                 st.info("Bienvenido, ADMIN.")
             else:
                 st.info(f"Bienvenido, {worker}.")
-            
+
             st.header(f"Registro para: {worker}")
-            
+
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("Registrar Entrada"):
@@ -380,10 +408,10 @@ if worker:
                         st.success(msg)
                     else:
                         st.warning(msg)
-            
+
             total_hours = get_worker_week_hours(worker)
             st.write("Total de horas trabajadas esta semana:", str(total_hours))
-            
+
             if worker == "Ricardo Adrian Ruiz":
                 st.subheader("Resumen Semanal General")
                 if st.button("Mostrar resumen de horas por trabajador"):
@@ -397,7 +425,7 @@ if worker:
                     df = load_week_data(filename)
                     worker_records = df[df["Nombre"] == worker]
                     st.dataframe(worker_records)
-            
+
             # --- Sección ADMIN: Descarga de registros semanales ---------------
             if worker == "Ricardo Adrian Ruiz":
                 st.markdown("---")
@@ -411,7 +439,7 @@ if worker:
                 week_files = list_week_files()
 
                 if not week_files:
-                    st.info("No hay archivos semanales en Firebase Storage.")
+                    st.info("No hay archivos semanales en Firestore.")
                 else:
                     selected_file = st.selectbox(
                         "Selecciona un archivo semanal para descargar:", [""] + week_files
@@ -422,7 +450,8 @@ if worker:
                     # Descargar archivo individual
                     with col_dl_one:
                         if selected_file:
-                            data = bucket.blob(selected_file).download_as_bytes()
+                            df_selected = load_week_data(selected_file)
+                            data = generate_excel_bytes(df_selected)
                             st.download_button(
                                 label=f"Descargar {selected_file}",
                                 data=data,
@@ -458,7 +487,7 @@ if worker:
                                 file_name="registros_all.zip",
                                 mime="application/zip"
                             )
-            
+
             # --- Sección ADMIN: Generar y descargar archivo mensual -----------
             if worker == "Ricardo Adrian Ruiz":
                 st.markdown("---")
@@ -498,7 +527,7 @@ if worker:
                     )
                     selected_month = month_names.index(selected_month_name) + 1
                     st.session_state["selected_month_num"] = selected_month
-                
+
                 if st.button("Generar archivo mensual"):
                     output_buffer = generate_monthly_file(selected_year, selected_month)
                     if output_buffer is not None:
