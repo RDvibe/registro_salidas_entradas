@@ -142,9 +142,14 @@ def save_week_data_and_upload(df, filename):
     """
     Guarda el DataFrame en Firestore bajo la colección 'semanas/{week_id}/registros'.
     Cada fila se guarda como un documento con ID '{Nombre}_{Fecha}'.
+    El documento padre semanas/{week_id} se crea explícitamente para que
+    list_week_files() pueda listarlo con .stream().
     """
     week_id = get_week_id(filename)
-    registros_ref = db.collection("semanas").document(week_id).collection("registros")
+    week_ref = db.collection("semanas").document(week_id)
+    # Crear/actualizar el documento padre para que sea visible en .stream()
+    week_ref.set({"week_id": week_id}, merge=True)
+    registros_ref = week_ref.collection("registros")
 
     for _, row in df.iterrows():
         doc_id = f"{row['Nombre']}_{row['Fecha']}"
