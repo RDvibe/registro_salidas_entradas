@@ -1,3 +1,17 @@
+import os
+
+# Firestore usa gRPC. En algunos entornos de despliegue un proxy HTTP altera
+# los metadatos gRPC y convierte el ID predeterminado `(default)` en
+# `%28default%29`, que Firestore rechaza. Excluimos solo este destino del
+# proxy antes de que se carguen las bibliotecas de Google.
+_grpc_no_proxy = {
+    value.strip()
+    for value in os.environ.get("no_grpc_proxy", "").split(",")
+    if value.strip()
+}
+_grpc_no_proxy.add("firestore.googleapis.com")
+os.environ["no_grpc_proxy"] = ",".join(sorted(_grpc_no_proxy))
+
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
